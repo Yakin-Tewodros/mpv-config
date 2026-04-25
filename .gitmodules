@@ -1,0 +1,6 @@
+[submodule "scripts/file-browser"]
+	path = scripts/file-browser
+	url = https://github.com/CogentRedTester/mpv-file-browser
+[submodule "scripts/mpv-cut"]
+	path = scripts/mpv-cut
+	url = https://github.com/familyfriendlymikey/mpv-cut.git
