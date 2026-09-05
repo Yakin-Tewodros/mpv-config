@@ -5,8 +5,9 @@ local settings = {
 
   -- to bind multiple keys separate them by a space
 
-  -- main key to show playlist
+  -- main keys to show playlist and command menu
   key_showplaylist = "SHIFT+ENTER",
+  key_openmenu = "",
 
   -- display playlist while key is held down
   key_peek_at_playlist = "",
@@ -30,6 +31,7 @@ local settings = {
   key_reverseplaylist = "",
   key_loadfiles = "",
   key_saveplaylist = "",
+  key_selectplaylist = "",
 
   --replaces matches on filenames based on extension, put as empty string to not replace anything
   --replace rules are executed in provided order
@@ -95,6 +97,8 @@ local settings = {
   --sort playlist when files are added to playlist
   sortplaylist_on_file_add = false,
 
+  reverseplaylist_on_startup = false,
+
   --default sorting method, must be one of: "name-asc", "name-desc", "date-asc", "date-desc", "size-asc", "size-desc".
   default_sort = "name-asc",
 
@@ -103,6 +107,9 @@ local settings = {
 
   --Use ~ for home directory. Leave as empty to use mpv/playlists
   playlist_savepath = "",
+
+  -- prompt for playlist filename on save
+  playlist_save_interactive = true,
 
   -- constant filename to save playlist as. Note that it will override existing playlist. Leave empty for generated name.
   playlist_save_filename = "",
@@ -221,6 +228,7 @@ opts.read_options(settings, "playlistmanager", function(list) update_opts(list) 
 local utils = require("mp.utils")
 local msg = require("mp.msg")
 local assdraw = require("mp.assdraw")
+local input = require("mp.input")
 
 local alignment_table = {
     [1] = { ["x"] = "left",   ["y"] = "bottom" },
@@ -293,6 +301,7 @@ local filename = nil
 local pos = 0
 local plen = 0
 local cursor = 0
+local reversed_playlist_on_startup = false
 --table for saved media titles for later if we prefer them
 local title_table = {}
 -- table for urls and local file paths that we have requested to be resolved to titles
@@ -445,6 +454,15 @@ end
 
 function is_protocol(path)
   return type(path) == 'string' and path:match('^%a[%a%d-_]+://') ~= nil
+end
+
+function on_preloaded_hook()
+  if settings.reverseplaylist_on_startup and not reversed_playlist_on_startup then
+    reverseplaylist()
+    mp.set_property("playlist-pos", 0)
+    cursor = 0
+    reversed_playlist_on_startup = true
+  end
 end
 
 function on_file_loaded()
@@ -664,9 +682,21 @@ function parse_filename_by_index(index)
   return parse_filename(template, get_name_from_index(index), index)
 end
 
+function is_terminal_mode()
+  local width, height, aspect_ratio = mp.get_osd_size()
+  return width == 0 and height == 0 and aspect_ratio == 0
+end
+
 function draw_playlist()
   refresh_globals()
+
+  -- if there is no playing file, then cursor can be -1. That would break rendering of playlist.
+  if cursor == -1 then
+    cursor = 0
+  end
+
   local ass = assdraw.ass_new()
+  local terminaloutput = ""
 	
   local _, _, a = mp.get_osd_size()
   local h = 720
@@ -728,7 +758,9 @@ function draw_playlist()
   ass:pos(pos_x, pos_y)
 
   if settings.playlist_header ~= "" then
-    ass:append(parse_header(settings.playlist_header).."\\N")
+    local header = parse_header(settings.playlist_header)
+    ass:append(header.."\\N")
+    terminaloutput = terminaloutput..header.."\n"
   end
 
   -- (visible index, playlist index) pairs of playlist entries that should be rendered
@@ -762,16 +794,28 @@ function draw_playlist()
   for display_index, playlist_index in pairs(visible_indices) do
     if display_index == 1 and playlist_index ~= 1 then
       ass:append(settings.playlist_sliced_prefix.."\\N")
+      terminaloutput = terminaloutput..settings.playlist_sliced_prefix.."\n"
     elseif display_index == settings.showamount and playlist_index ~= plen then
       ass:append(settings.playlist_sliced_suffix)
+      terminaloutput = terminaloutput..settings.playlist_sliced_suffix.."\n"
     else
       -- parse_filename_by_index expects 0 based index
-      ass:append(parse_filename_by_index(playlist_index - 1).."\\N")
+      local fname = parse_filename_by_index(playlist_index - 1)
+      ass:append(fname.."\\N")
+      terminaloutput = terminaloutput..fname.."\n"
     end
   end
 
-  playlist_overlay.data = ass.text
-  playlist_overlay:update()
+  if is_terminal_mode() then
+    local timeout_setting = settings.playlist_display_timeout
+    local timeout = timeout_setting == 0 and 2147483 or timeout_setting
+    -- TODO: probably have to strip ass tags from terminal output
+    -- would maybe be possible to use terminal color output instead
+    mp.osd_message(terminaloutput, timeout)
+  else
+    playlist_overlay.data = ass.text
+    playlist_overlay:update()
+  end
 end
 
 local peek_display_timer = nil
@@ -927,25 +971,43 @@ function movedown()
   showplaylist()
 end
 
+
 function movepageup()
   refresh_globals()
   if plen == 0 or cursor == 0 then return end
+  local offset = settings.showamount % 2 == 0 and 1 or 0
+  local last_file_that_doesnt_scroll = math.ceil(settings.showamount / 2)
+  local reverse_cursor = plen - cursor
+  local files_to_jump = math.max(last_file_that_doesnt_scroll + offset - reverse_cursor, 0) + settings.showamount - 2
   local prev_cursor = cursor
-  cursor = cursor - settings.showamount
-  if cursor < 0 then cursor = 0 end
-  if selection then mp.commandv("playlist-move", prev_cursor, cursor) end
+  cursor = cursor - files_to_jump
+  if cursor < last_file_that_doesnt_scroll then
+    cursor = 0
+  end
+  if selection then
+    mp.commandv("playlist-move", prev_cursor, cursor)
+  end
   showplaylist()
 end
 
 function movepagedown()
   refresh_globals()
-  if plen == 0 or cursor == plen-1 then return end
+  if plen == 0 or cursor == plen - 1 then return end
+  local last_file_that_doesnt_scroll = math.ceil(settings.showamount / 2) - 1
+  local files_to_jump = math.max(last_file_that_doesnt_scroll - cursor, 0) + settings.showamount - 2
   local prev_cursor = cursor
-  cursor = cursor + settings.showamount
-  if cursor >= plen then cursor = plen-1 end
-  if selection then mp.commandv("playlist-move", prev_cursor, cursor+1) end
+  cursor = cursor + files_to_jump
+
+  local cursor_on_last_page = plen - (settings.showamount - 3)
+  if cursor > cursor_on_last_page then
+    cursor = plen - 1
+  end
+  if selection then
+    mp.commandv("playlist-move", prev_cursor, cursor + 1)
+  end
   showplaylist()
 end
+
 
 function movebegin()
   refresh_globals()
@@ -1014,6 +1076,10 @@ function playfile()
   if cursor ~= pos or is_idle then
     write_watch_later()
     mp.set_property("playlist-pos", cursor)
+    if (mp.get_property_native('pause')) then     -- TK resume playback on playlist file selection
+      mp.set_property_native("pause",false)
+      msg.info("Pause cycled")
+    end
   else
     if cursor~=plen-1 then
       cursor = cursor + 1
@@ -1132,6 +1198,73 @@ function playlist(force_dir)
   return c + c2
 end
 
+local menu_items = {
+  {
+    label = "Show playlist",
+    action = function()
+      showplaylist()
+    end,
+  },
+  {
+    label = "Save playlist",
+    action = function()
+      mp.add_timeout(0.1, activate_playlist_save)
+    end,
+  },
+  {
+    label = "Select playlist",
+    action = function()
+      mp.add_timeout(0.1, select_playlist)
+    end,
+  },
+  {
+    label = "Load files to playlist",
+    action = function()
+      playlist()
+    end,
+  },
+  {
+    label = "Sort playlist",
+    action = function()
+      sortplaylist_by_next_mode()
+    end,
+  },
+  {
+    label = "Reverse playlist",
+    action = function()
+      reverseplaylist()
+    end,
+  },
+  {
+    label = "Shuffle playlist",
+    action = function()
+      shuffleplaylist()
+    end,
+  },
+  {
+    label = "Play random file",
+    action = function()
+      playlist_random()
+    end,
+  },
+}
+
+local menu_labels = {}
+for _, item in pairs(menu_items) do
+  table.insert(menu_labels, item.label)
+end
+
+function open_menu()
+  remove_keybinds()
+  input.select({
+    prompt = "Search menu: ",
+    items = menu_labels,
+    submit = function (index)
+      menu_items[index].action()
+    end,
+  })
+end
+
 function parse_home(path)
   if not path:find("^~") then
     return path
@@ -1151,13 +1284,60 @@ function parse_home(path)
   return result
 end
 
-local interactive_save = false
+function activate_playlist_name_prompt()
+  input.get({
+    cursor_position = 1,
+    prompt = "Enter playlist name: ",
+    submit = function (text)
+      input.terminate()
+      save_playlist(text)
+    end,
+    default_text = ".m3u"
+  })
+end
+
 function activate_playlist_save()
-  if interactive_save then
+  if settings.playlist_save_interactive then
     remove_keybinds()
-    mp.command("script-message playlistmanager-save-interactive \"start interactive filenaming process\"")
+    activate_playlist_name_prompt()
   else
     save_playlist()
+  end
+end
+
+
+function select_playlist()
+  remove_keybinds()
+  local save_path = get_playlist_save_path()
+  local files, err = utils.readdir(save_path, "files")
+  if err ~= nil then
+    mp.error("Error reading playlist files", err)
+    return
+  end
+
+  local playlists = {}
+  for index, file in pairs(files) do
+    table.insert(playlists, file)
+  end
+
+  input.select({
+    prompt = "Search for playlist: ",
+    items = playlists,
+    submit = function (index)
+      mp.commandv("loadfile", utils.join_path(save_path, playlists[index]))
+    end,
+  })
+end
+
+function get_playlist_save_path()
+  if settings.playlist_savepath == nil or settings.playlist_savepath == "" then
+    return mp.command_native({"expand-path", "~~home/"}).."/playlists"
+  else
+    local p = parse_home(settings.playlist_savepath)
+    if p == nil then
+      msg.error("Could not resolve playlist save path")
+    end
+    return p or ""
   end
 end
 
@@ -1167,13 +1347,7 @@ function save_playlist(filename)
   if length == 0 then return end
 
   --get playlist save path
-  local savepath
-  if settings.playlist_savepath == nil or settings.playlist_savepath == "" then
-    savepath = mp.command_native({"expand-path", "~~home/"}).."/playlists"
-  else
-    savepath = parse_home(settings.playlist_savepath)
-    if savepath == nil then return end
-  end
+  local savepath = get_playlist_save_path()
 
   --create savepath if it doesn't exist
   if utils.readdir(savepath) == nil then
@@ -1244,7 +1418,7 @@ function sortplaylist(startover)
   local order = {}
   for i=1, #playlist do
 		order[i] = i
-    playlist[i].string = get_name_from_index(i - 1, true)
+    playlist[i].string = get_name_from_index(i - 1)
 	end
 
   table.sort(order, function(a, b)
@@ -1286,6 +1460,12 @@ function sortplaylist(startover)
   if settings.display_osd_feedback then
     mp.osd_message("Playlist sorted with "..sort_modes[sort_mode].title)
   end
+end
+
+function sortplaylist_by_next_mode()
+  sortplaylist()
+  sort_mode = sort_mode + 1
+  if sort_mode > #sort_modes then sort_mode = 1 end
 end
 
 function reverseplaylist()
@@ -1388,6 +1568,9 @@ function remove_keybinds()
   keybindstimer:kill()
   playlist_overlay.data = ""
   playlist_overlay:remove()
+  if is_terminal_mode() then
+    mp.osd_message("")
+  end
   playlist_visible = false
   if settings.reset_cursor_on_close then
     resetcursor()
@@ -1627,24 +1810,24 @@ function handlemessage(msg, value, value2)
   if msg == "reverse" then reverseplaylist() ; return end
   if msg == "loadfiles" then playlist(value) ; return end
   if msg == "save" then save_playlist(value) ; return end
+  if msg == "save-interactive" then activate_playlist_name_prompt() ; return end
+  if msg == "open-menu" then open_menu() ; return end
+  if msg == "select-playlist" then select_playlist() ; return end
   if msg == "playlist-next" then playlist_next() ; return end
   if msg == "playlist-prev" then playlist_prev() ; return end
   if msg == "playlist-next-random" then playlist_random() ; return end
-  if msg == "enable-interactive-save" then interactive_save = true end
   if msg == "close" then remove_keybinds() end
 end
 
 mp.register_script_message("playlistmanager", handlemessage)
 
-bind_keys(settings.key_sortplaylist, "sortplaylist", function()
-  sortplaylist()
-  sort_mode = sort_mode + 1
-  if sort_mode > #sort_modes then sort_mode = 1 end
-end)
+bind_keys(settings.key_sortplaylist, "sortplaylist", sortplaylist_by_next_mode)
 bind_keys(settings.key_shuffleplaylist, "shuffleplaylist", shuffleplaylist)
 bind_keys(settings.key_reverseplaylist, "reverseplaylist", reverseplaylist)
 bind_keys(settings.key_loadfiles, "loadfiles", playlist)
 bind_keys(settings.key_saveplaylist, "saveplaylist", activate_playlist_save)
+bind_keys(settings.key_selectplaylist, "selectplaylist", select_playlist)
+bind_keys(settings.key_openmenu, "openmenu", open_menu)
 bind_keys(settings.key_showplaylist, "showplaylist", showplaylist)
 bind_keys(
   settings.key_peek_at_playlist,
@@ -1656,3 +1839,4 @@ bind_keys(
 mp.register_event("start-file", on_start_file)
 mp.register_event("file-loaded", on_file_loaded)
 mp.register_event("end-file", on_end_file)
+mp.add_hook("on_preloaded", 50, on_preloaded_hook)
